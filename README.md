@@ -1,93 +1,116 @@
-# pocket-test — Pocket-AI CI/CD validation
+# pocket-test — Pocket-AI validation and CI/CD
 
-Repositorio aislado para validar dos cadenas complementarias:
+Repositorio aislado para validar:
 
-`ZIP Pocket-AI → dataset/index → FastAPI → Docker`
+`Pocket-AI package → dataset/index → FastAPI → Docker → Google Sheets`
 
-`FastAPI → Google Sheets (lectura) → índice live`
+y, cuando se configura una credencial de lectura:
 
-El `main` de `wpv10barza/erp-mantto-esp32` se usa como referencia de contrato/ejecución, pero no se modifica desde este repositorio.
+`Google Sheets → índice live read-only → búsqueda`.
 
-## Estado corregido del Sheet
+El repositorio `wpv10barza/erp-mantto-esp32` conserva el contrato del dispositivo y se mantiene separado de la persistencia de Google Sheets.
 
-Google Sheet: `Estrategias_20260527_2119`
+## Google Sheet validado
 
-- pestaña: `Data`
-- cabecera: fila `4`
-- rango de plantilla: `A:AF`
-- columnas revisables: `F,I,J,L,M,N,O,P,Q`
-- columnas protegidas: `A,E,AB,AC,AD,AE,AF`
+- Spreadsheet: `Estrategias_20260527_2119`
+- ID: `1tLNo0_xjtmWKM9Y7PcChFut8S0w0kMKeAvFi9zg52gA`
+- Pestaña: `Data`
+- Cabecera: fila `4`
+- Plantilla: `A:AF`
+- Revisables: `F,I,J,L,M,N,O,P,Q`
+- Protegidas: `A,E,AB,AC,AD,AE,AF`
 
-La versión original del ZIP tenía un mapeo A:Q obsoleto. Esta rama corrige, entre otros, `ComentariosCondicionales=J` y `Especialidad=N`.
+El adaptador usa fail-closed: antes de una escritura vuelve a verificar `Data!A4:AF4`. Si la plantilla no coincide, la operación se rechaza.
 
-## WSL: clonar y ejecutar
+## Ejecución WSL / Linux
 
 ```bash
 git clone https://github.com/wpv10barza/pocket-test.git
 cd pocket-test
 cp .env.example .env
-# coloque una credencial de lectura válida solo en .env; nunca haga git add .env
-docker compose up --build -d
-curl http://localhost:8000/health
-curl http://localhost:8000/index/status
-curl -X POST http://localhost:8000/index/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"termografía punto caliente tablero","top_k":3}'
-curl http://localhost:8000/sheet/verify
-```
-
-Para indexar las filas reales del Google Sheet en memoria, sin escribir:
-
-```bash
-curl -X POST http://localhost:8000/index/sheet/rebuild \
-  -H 'Content-Type: application/json' \
-  -d '{"max_rows":996}'
-curl http://localhost:8000/index/sheet/status
-curl -X POST http://localhost:8000/index/sheet/search \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"panel distribución punto caliente","top_k":5}'
-```
-
-`/index/sheet/rebuild` primero verifica que `Data!A4:AF4` siga siendo la plantilla esperada y después solo lee `A5:AF1000`. Devuelve `write_performed=false`.
-
-Para actualizar un checkout existente:
-
-```bash
-cd ~/pocket-test
-git switch main
-git pull --ff-only origin main
-cp -n .env.example .env
+nano .env
 docker compose up --build -d
 ```
 
-## Autenticación de Google Sheets
+Verificación:
 
-- `GOOGLE_API_KEY`: lectura únicamente cuando Google permite acceder al Sheet con API key (por ejemplo, datos públicos/compatibles con ese modo).
-- `GOOGLE_ACCESS_TOKEN`: lectura privada y modo admitido para escritura autorizada.
-- `ALLOW_SHEET_WRITE=false` por defecto.
-- `/apply` exige `approved=true`, vuelve a verificar `Data!A4:AF4` y recién después intenta escribir.
-- El XLSX operativo del ZIP no se publica porque el repositorio es público.
+```bash
+curl -sS http://localhost:8000/health | jq
+curl -sS http://localhost:8000/index/status | jq
+curl -sS -X POST http://localhost:8000/index/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"termografía punto caliente tablero","top_k":3}' | jq
+```
 
-## Sin Docker
+## Indexación read-only del Google Sheet
+
+Con una credencial de lectura válida en `.env`:
+
+```bash
+curl -sS http://localhost:8000/sheet/verify | jq
+
+curl -sS -X POST http://localhost:8000/index/sheet/rebuild \
+  -H 'Content-Type: application/json' \
+  -d '{"max_rows":996}' | jq
+
+curl -sS -X POST http://localhost:8000/index/sheet/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"panel distribución punto caliente","top_k":5}' | jq
+```
+
+`/index/sheet/rebuild` solo lee datos y devuelve `write_performed=false`.
+
+## Escritura controlada
+
+Por defecto:
+
+```dotenv
+ALLOW_SHEET_WRITE=false
+```
+
+Para escribir se requieren simultáneamente:
+
+- `GOOGLE_ACCESS_TOKEN` válido;
+- `ALLOW_SHEET_WRITE=true`;
+- solicitud `/apply` con `approved=true`;
+- plantilla `Data!A4:AF4` sin cambios;
+- columna incluida en el conjunto revisable.
+
+Una API key nunca habilita escritura.
+
+## CI/CD
+
+Existe un único workflow: `.github/workflows/ci-cd.yml`.
+
+En cada Pull Request y push ejecuta:
+
+1. compilación de todos los módulos Python;
+2. generación y validación de los 360 registros Pocket-AI;
+3. escaneo de secretos versionados;
+4. pruebas unitarias/API;
+5. construcción de Docker;
+6. smoke test de `/health`, índice y búsqueda;
+7. prueba fail-closed de `/apply`;
+8. comprobación de que la imagen no contiene credenciales Google.
+
+Solo en un push exitoso a `main`, después de todas las pruebas, publica:
+
+```text
+ghcr.io/wpv10barza/pocket-test:latest
+ghcr.io/wpv10barza/pocket-test:<commit-sha>
+```
+
+El job de pruebas tiene únicamente `contents: read`. El permiso `packages: write` existe exclusivamente en el job de publicación.
+
+## Pruebas locales sin Docker
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+python scripts/check_repo_security.py
 python scripts/validate_package.py
 pytest -q
-uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-## CI/CD
-
-`.github/workflows/ci-cd.yml` ejecuta:
-
-1. generador del ZIP corregido (360 registros);
-2. validación del mapeo real;
-3. pruebas API/index;
-4. `docker build`;
-5. smoke test del contenedor;
-6. en `main`, publicación a `ghcr.io/wpv10barza/pocket-test:latest`.
-
-La CI no guarda credenciales de Google. La prueba live se ejecuta en WSL con `.env` o mediante credenciales gestionadas fuera del repositorio.
+No versionar `.env`, tokens OAuth, claves API, JSON de service account ni claves privadas.

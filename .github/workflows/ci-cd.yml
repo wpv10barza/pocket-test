@@ -1,54 +1,116 @@
 name: CI-CD
+
 on:
   push:
     branches: [main]
   pull_request:
-permissions:
-  contents: read
-  packages: write
+  workflow_dispatch:
+
 concurrency:
-  group: pocket-test-${{ github.ref }}
+  group: pocket-test-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
 jobs:
-  test-build-publish:
+  quality:
+    name: Python + package validation
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - name: Install Python dependencies
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Validate imported Pocket-AI package
+      - name: Compile Python
+        run: python -m compileall -q app scripts tests pack/02_dataset
+      - name: Validate Pocket-AI package
         run: python scripts/validate_package.py
-      - name: Unit/API tests
+      - name: Repository secret scan
+        run: python scripts/check_repo_security.py
+      - name: Unit and API tests
         run: pytest -q
-      - name: Build Docker image
-        run: docker build -t pocket-test:${{ github.sha }} .
-      - name: Container smoke test
+
+  docker-smoke:
+    name: Docker build + smoke
+    needs: quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --pull -t pocket-test:${{ github.sha }} .
+      - name: Start container
         run: |
-          docker run -d --rm --name pocket-test-ci -p 8000:8000 pocket-test:${{ github.sha }}
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health && break || sleep 1; done
+          docker run -d --rm --name pocket-test-ci -p 8000:8000 -e ALLOW_SHEET_WRITE=false pocket-test:${{ github.sha }}
+      - name: Wait for health
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health >/tmp/health.json; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs pocket-test-ci
+          exit 1
+      - name: Verify packaged index
+        run: |
+          set -euo pipefail
           curl -fsS http://127.0.0.1:8000/index/status | tee /tmp/index.json
-          curl -fsS -X POST http://127.0.0.1:8000/index/search -H 'Content-Type: application/json' -d '{"query":"termografía punto caliente tablero","top_k":3}'
-          python - <<'PY2'
-          import json
-          j=json.load(open('/tmp/index.json'))
-          assert j['records']==360 and j['status']=='ready'
-          PY2
-          docker stop pocket-test-ci
+          python -c "import json; j=json.load(open('/tmp/index.json')); assert j['status']=='ready' and j['records']==360 and j['source']=='validated_package_dataset'"
+          curl -fsS -X POST http://127.0.0.1:8000/index/search -H 'Content-Type: application/json' -d '{"query":"termografía punto caliente tablero","top_k":3}' | tee /tmp/search.json
+          python -c "import json; j=json.load(open('/tmp/search.json')); assert j['matches'] and j['source']=='validated_package_dataset'"
+      - name: Verify fail-closed write path
+        run: |
+          set -euo pipefail
+          code=$(curl -sS -o /tmp/apply.json -w '%{http_code}' -X POST http://127.0.0.1:8000/apply -H 'Content-Type: application/json' -d '{"row":5,"column":"J","value":"CI must not write","approved":false}')
+          cat /tmp/apply.json
+          test "$code" = "409"
+          python -c "import json; j=json.load(open('/tmp/apply.json')); assert 'Human approval is required' in j['detail']"
+      - name: Verify Google auth is not baked into image
+        run: |
+          set -euo pipefail
+          curl -fsS http://127.0.0.1:8000/health | tee /tmp/health.json
+          python -c "import json; j=json.load(open('/tmp/health.json')); assert j['sheet_auth_mode']=='unconfigured' and j['sheet_write_enabled'] is False"
+      - name: Container logs
+        if: always()
+        run: docker logs pocket-test-ci || true
+      - name: Stop container
+        if: always()
+        run: docker stop pocket-test-ci || true
+
+  publish-ghcr:
+    name: Publish GHCR
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: docker-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
       - name: Log in to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push Docker image to GHCR
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Build release image
         run: |
+          set -euo pipefail
           IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}
-          docker tag pocket-test:${GITHUB_SHA} ${IMAGE}:latest
-          docker tag pocket-test:${GITHUB_SHA} ${IMAGE}:${GITHUB_SHA}
+          docker build --pull --label org.opencontainers.image.revision=${GITHUB_SHA} --label org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY} -t ${IMAGE}:latest -t ${IMAGE}:${GITHUB_SHA} .
+      - name: Push release image
+        run: |
+          set -euo pipefail
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}
           docker push ${IMAGE}:latest
           docker push ${IMAGE}:${GITHUB_SHA}
