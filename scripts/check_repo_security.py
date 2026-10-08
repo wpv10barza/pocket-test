@@ -6,11 +6,13 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SELF = Path("scripts/check_repo_security.py")
 
-PATTERNS = {
-    "Google access token assignment": re.compile(r"(?im)^\s*GOOGLE_ACCESS_TOKEN\s*=\s*[^\s#][^\r\n]*$"),
-    "Google API key assignment": re.compile(r"(?im)^\s*GOOGLE_API_KEY\s*=\s*[^\s#][^\r\n]*$"),
-    "Google private key": re.compile(r"-----BEGIN PRIVATE KEY-----"),
+TOKEN_PATTERNS = {
+    "Google API key": re.compile("AI" + "za[0-9A-Za-z_-]{30,}"),
+    "GitHub classic token": re.compile("gh" + "p_[A-Za-z0-9]{30,}"),
+    "GitHub fine-grained token": re.compile("github_" + "pat_[A-Za-z0-9_]{40,}"),
+    "AWS access key id": re.compile("AK" + "IA[0-9A-Z]{16}"),
 }
 
 SKIP_SUFFIXES = {
@@ -24,19 +26,42 @@ def tracked_files() -> list[Path]:
     return [ROOT / p.decode("utf-8") for p in raw.split(b"\0") if p]
 
 
+def nonempty_assignment(text: str, name: str) -> list[int]:
+    hits: list[int] = []
+    prefix = name + "="
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        value = stripped[len(prefix):].strip()
+        if value and not value.startswith("#"):
+            hits.append(number)
+    return hits
+
+
 def main() -> None:
     findings: list[str] = []
     for path in tracked_files():
-        if path.suffix.lower() in SKIP_SUFFIXES or not path.is_file():
+        rel = path.relative_to(ROOT)
+        if rel == SELF or path.suffix.lower() in SKIP_SUFFIXES or not path.is_file():
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            content = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        rel = path.relative_to(ROOT)
-        for name, pattern in PATTERNS.items():
-            for match in pattern.finditer(text):
-                line = text.count("\n", 0, match.start()) + 1
+
+        for env_name in ("GOOGLE_API_KEY", "GOOGLE_ACCESS_TOKEN"):
+            for line in nonempty_assignment(content, env_name):
+                findings.append(f"{rel}:{line}: non-empty {env_name}")
+
+        private_key_marker = "-----BEGIN " + "PRIVATE KEY-----"
+        if private_key_marker in content:
+            line = content.count("\n", 0, content.index(private_key_marker)) + 1
+            findings.append(f"{rel}:{line}: private key material")
+
+        for name, pattern in TOKEN_PATTERNS.items():
+            for match in pattern.finditer(content):
+                line = content.count("\n", 0, match.start()) + 1
                 findings.append(f"{rel}:{line}: {name}")
 
     if findings:
