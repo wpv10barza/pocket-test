@@ -1,56 +1,77 @@
-# pocket-test
+# pocket-test — Pocket-AI CI/CD validation
 
-Isolated validation repo for:
+Repositorio aislado para validar la cadena:
 
-`Git repository -> Docker image -> FastAPI -> Google Sheets`
+`ZIP Pocket-AI → dataset/index → FastAPI → Docker → Google Sheets`
 
-Target: spreadsheet `Estrategias_20260527_2119`, tab `Data`, ID `1tLNo0_xjtmWKM9Y7PcChFut8S0w0kMKeAvFi9zg52gA`.
+El `main` de `wpv10barza/erp-mantto-esp32` se usa como referencia de contrato/ejecución, pero no se modifica desde este repositorio.
 
-## Finding from the Pocket-AI pack
+## Estado corregido del Sheet
 
-The uploaded pack generated 360 synthetic records successfully, but its Python generator used an obsolete A:Q map. The live Sheet header row is:
+Google Sheet: `Estrategias_20260527_2119`
 
-- I = LimitesAceptables
-- J = ComentariosCondicionales
-- K = Origen
-- L = Frecuencia
-- M = UnidadTiempo
-- N = Especialidad
-- O = Labour1
-- P = Labour1Cantidad
-- Q = Labour1Horas
+- pestaña: `Data`
+- cabecera: fila `4`
+- rango de plantilla: `A:AF`
+- columnas revisables: `F,I,J,L,M,N,O,P,Q`
+- columnas protegidas: `A,E,AB,AC,AD,AE,AF`
 
-This repo fails closed when the live template differs.
+La versión original del ZIP tenía un mapeo A:Q obsoleto. Esta rama corrige, entre otros, `ComentariosCondicionales=J` y `Especialidad=N`.
 
-The local Excel workbook is intentionally not committed because this repository is public and the workbook contains operational data. Secrets are also excluded.
-
-## WSL / Docker
+## WSL: clonar y ejecutar
 
 ```bash
+git clone https://github.com/wpv10barza/pocket-test.git
+cd pocket-test
 cp .env.example .env
-docker compose up --build
+# coloque su GOOGLE_API_KEY solo en .env; nunca haga git add .env
+docker compose up --build -d
 curl http://localhost:8000/health
+curl http://localhost:8000/index/status
+curl -X POST http://localhost:8000/index/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"termografía punto caliente tablero","top_k":3}'
 curl http://localhost:8000/sheet/verify
 ```
 
-## Authentication
-
-- `GOOGLE_API_KEY`: read-only verification only when the Sheet is readable without user OAuth.
-- `GOOGLE_ACCESS_TOKEN`: private read access and the supported mode for writes.
-- An API key alone is not enough for private/write access.
-
-`ALLOW_SHEET_WRITE=false` is the default. `/apply` also requires `approved=true` and re-verifies the A:AF header row before a write.
-
-## Safe proposal test
+Para actualizar un checkout existente:
 
 ```bash
-curl -X POST http://localhost:8000/proposal \
-  -H 'Content-Type: application/json' \
-  -d '{"row":5,"column":"J","value":"Prueba controlada","approved":false}'
+cd ~/pocket-test
+git switch main
+git pull --ff-only origin main
+cp -n .env.example .env
+docker compose up --build -d
 ```
 
-This does not write to Google Sheets.
+## Sin Docker
 
-## Relation to erp-mantto-esp32
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python scripts/validate_package.py
+pytest -q
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
 
-`wpv10barza/erp-mantto-esp32` is the firmware/device-contract repository. Its Device API tests transport and human confirmation. Google Sheets persistence is intentionally outside the firmware repo, so this repository isolates the spreadsheet adapter without changing firmware `main`.
+## Seguridad de Google Sheets
+
+- `GOOGLE_API_KEY`: solo lectura/verificación en este servicio.
+- `GOOGLE_ACCESS_TOKEN`: requerido para escritura.
+- `ALLOW_SHEET_WRITE=false` por defecto.
+- `/apply` exige `approved=true`, vuelve a verificar `Data!A4:AF4` y recién después intenta escribir.
+- El XLSX operativo del ZIP no se publica porque el repositorio es público.
+
+## CI/CD
+
+`.github/workflows/ci-cd.yml` ejecuta:
+
+1. generador del ZIP corregido (360 registros);
+2. validación del mapeo real;
+3. pruebas API/index;
+4. `docker build`;
+5. smoke test del contenedor;
+6. en `main`, publicación a `ghcr.io/wpv10barza/pocket-test:latest`.
+
+La verificación live de Google Sheets se hace en WSL con `.env`; la CI no necesita ni registra credenciales de Google.

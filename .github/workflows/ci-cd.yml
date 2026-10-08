@@ -1,0 +1,54 @@
+name: CI-CD
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: pocket-test-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test-build-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Validate imported Pocket-AI package
+        run: python scripts/validate_package.py
+      - name: Unit/API tests
+        run: pytest -q
+      - name: Build Docker image
+        run: docker build -t pocket-test:${{ github.sha }} .
+      - name: Container smoke test
+        run: |
+          docker run -d --rm --name pocket-test-ci -p 8000:8000 pocket-test:${{ github.sha }}
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8000/health && break || sleep 1; done
+          curl -fsS http://127.0.0.1:8000/index/status | tee /tmp/index.json
+          curl -fsS -X POST http://127.0.0.1:8000/index/search -H 'Content-Type: application/json' -d '{"query":"termografía punto caliente tablero","top_k":3}'
+          python - <<'PY2'
+          import json
+          j=json.load(open('/tmp/index.json'))
+          assert j['records']==360 and j['status']=='ready'
+          PY2
+          docker stop pocket-test-ci
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push Docker image to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}
+          docker tag pocket-test:${GITHUB_SHA} ${IMAGE}:latest
+          docker tag pocket-test:${GITHUB_SHA} ${IMAGE}:${GITHUB_SHA}
+          docker push ${IMAGE}:latest
+          docker push ${IMAGE}:${GITHUB_SHA}

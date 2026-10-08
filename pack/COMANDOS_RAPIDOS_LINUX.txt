@@ -1,0 +1,4 @@
+cd pack
+chmod +x 04_scripts/train_and_prepare_linux.sh
+./04_scripts/train_and_prepare_linux.sh
+cat outputs/pocket-ai/logs/hailort.log

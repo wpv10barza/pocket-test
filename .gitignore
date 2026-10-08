@@ -5,5 +5,5 @@ __pycache__/
 *.pyc
 credentials.json
 service-account*.json
-01_sheet/*.xlsx
-outputs/
+pack/01_sheet/*.xlsx
+pack/outputs/
